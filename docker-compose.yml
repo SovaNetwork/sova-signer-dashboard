@@ -1,0 +1,147 @@
+# Docker compose file for UTXO indexer and storage services
+# This includes the core services needed for UTXO indexing and Bitcoin interaction
+# from the Sova OP testnet sequencer configuration
+#
+# SETUP: Copy env.example to .env and configure for your environment
+#
+# BITCOIN NODE OPTIONS:
+# 1. Local Bitcoin Node: Use profile 'local-bitcoin' to run a local regtest node
+# 2. External Bitcoin RPC API: Use profile 'external-bitcoin' with BITCOIN_RPC_URL
+#
+# Usage examples:
+# Local Bitcoin: docker-compose --profile local-bitcoin up
+# External Bitcoin: docker-compose --profile external-bitcoin up
+
+services:
+  # Optional local Bitcoin node for development/testing
+  bitcoin-regtest:
+    image: ruimarinho/bitcoin-core:24
+    command:
+      -regtest=1
+      -server=1
+      -txindex=1
+      -rpcallowip=0.0.0.0/0
+      -rpcbind=0.0.0.0
+      -rpcuser=${BITCOIN_RPC_USER}
+      -rpcpassword=${BITCOIN_RPC_PASSWORD}
+    ports:
+      - "18443:18443"
+    networks:
+      - sova_network
+    volumes:
+      - bitcoin-data:/home/bitcoin/.bitcoin
+    healthcheck:
+      test: [
+        "CMD",
+        "bitcoin-cli",
+        "-regtest",
+        "-rpcuser=${BITCOIN_RPC_USER}",
+        "-rpcpassword=${BITCOIN_RPC_PASSWORD}",
+        "getblockchaininfo"
+      ]
+      interval: 5s
+      timeout: 10s
+      retries: 3
+    profiles: [local-bitcoin]
+
+  network-enclave:
+    image: ghcr.io/sovanetwork/network-enclave:v0.0.8
+    environment:
+      - BIP32_SEED=${ENCLAVE_BIP32_SEED}
+      - ENCLAVE_API_KEY=${ENCLAVE_API_KEY}
+    ports:
+      - "5555:5555"
+    command: >
+      --host 0.0.0.0
+      --port 5555
+      --network ${BITCOIN_NETWORK}
+      --address-map-path /var/lib/enclave/address_map.bin
+      --log-level ${LOG_LEVEL}
+    networks:
+      - sova_network
+    volumes:
+      - enclave-data:/var/lib/enclave
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5555/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    profiles: [local-bitcoin, external-bitcoin]
+
+  network-indexer:
+    image: ghcr.io/sovanetwork/network-indexer:v0.2.5
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL}
+      - NETWORK=${BITCOIN_NETWORK}
+      - RPC_HOST=${BITCOIN_RPC_URL}
+      - RPC_CONNECTION_TYPE=${BITCOIN_CONNECTION_TYPE:-bitcoincore}
+      - RPC_USER=${BITCOIN_RPC_USER}
+      - RPC_PASSWORD=${BITCOIN_RPC_PASSWORD}
+      - SOCKET_PATH=/tmp/network-utxos.sock
+      - START_HEIGHT=${INDEXER_START_BLOCK}
+      - POLLING_RATE=${INDEXER_POLLING_RATE}
+      - MAX_BLOCKS_PER_BATCH=${INDEXER_MAX_BLOCKS}
+      - API_HOST=0.0.0.0
+      - API_PORT=3031
+      - ENCLAVE_URL=http://network-enclave:5555
+      - UTXO_URL=http://network-utxos:5557
+      - ENCLAVE_API_KEY=${ENCLAVE_API_KEY}
+      - INDEXER_API_KEY=${INDEXER_SHARED_API_KEY}
+      - WATCHLIST_SEED=${WATCHLIST_SEED}
+    ports:
+      - "3031:3031"
+    networks:
+      - sova_network
+    depends_on:
+      network-utxos:
+        condition: service_started
+      network-enclave:
+        condition: service_healthy
+    volumes:
+      - indexer-cache:/app/cache
+      - socket:/tmp
+    profiles: [local-bitcoin, external-bitcoin]
+  
+  network-utxos:
+    image: ghcr.io/sovanetwork/network-utxos:v0.2.5
+    environment:
+      - NETWORK=${BITCOIN_NETWORK}
+      - HOST=${UTXO_HOST}
+      - PORT=${UTXO_PORT}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - DATASOURCE=${UTXO_DATASOURCE}
+      - SOCKET_PATH=/tmp/network-utxos.sock
+    ports:
+      - "5557:5557"
+    networks:
+      - sova_network
+    volumes:
+      - utxo-data:/data
+      - socket:/tmp
+    profiles: [local-bitcoin, external-bitcoin]
+
+  dashboard:
+    image: nginx:alpine
+    container_name: utxo-dashboard
+    ports:
+      - "8080:80"
+    volumes:
+      - ./index.html:/usr/share/nginx/html/index.html:ro
+      - ./nginx-cors.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - sova_network
+    profiles: [local-bitcoin, external-bitcoin]
+    depends_on:
+      - network-indexer
+
+networks:
+  sova_network:
+    driver: bridge
+
+volumes:
+  bitcoin-data:
+  enclave-data:
+  utxo-data:
+  socket:
+  indexer-cache:
